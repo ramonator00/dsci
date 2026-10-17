@@ -1,8 +1,9 @@
 # Verwendete Bibliotheken
-import matplotlib.pyplot as plt
-import numpy as np
 import os
 import sys
+
+import matplotlib.pyplot as plt
+import numpy as np
 
 sys.path.append('<your directory>')
 import object_extraction as oe
@@ -10,26 +11,11 @@ from matplotlib.colors import rgb_to_hsv as mpl_rgb_to_hsv
 from pathlib import Path
 from skimage.transform import resize
 from skimage.morphology import remove_small_holes, remove_small_objects, square
+from scipy.ndimage import binary_fill_holes
+from skimage.morphology import binary_opening, binary_closing, convex_hull_image, disk
 from skimage.measure import label
 from skimage.io import imsave
 
-
-def rgb_to_hsv_compatible(im):
-    im = np.asarray(im, dtype=np.float32)
-
-    if im.max() > 1:
-        im = im / 255.0
-
-    hsv = mpl_rgb_to_hsv(im)
-
-    # Value-Kanal wieder auf 0–255
-    hsv[:, :, 2] *= 255
-
-    return hsv
-
-oe.rgb_to_hsv = rgb_to_hsv_compatible
-
-print("Kompatibilitäts-Patch geladen.")
 
 # ==========================================================
 # KONFIGURATION
@@ -60,7 +46,6 @@ fc = 0.13         # Rand links/rechts abschneiden
 
 es = 5            # Erosion
 _ds_black = 6
-_ds_blue = 14
 mpx = 1000
 min_mask_object_size = 250        # minimale Objektgrösse
 fv = 0            # Randfüllung schwarz
@@ -123,18 +108,15 @@ def build_mask_for_background(im_hsv, bg_rgb):
     is_blue_background = bg_sat > 35 and 95 <= bg_hue <= 175
 
     if is_blue_background:
-        vth = max(70, min(130, int(bg_val + 12)))
-        hue_margin = 22
-        sat_min = max(25, int(bg_sat - 45))
-        ds = _ds_blue
-
+        # Dunkle Objektflächen müssen erhalten bleiben. Blaue Ballflächen
+        # werden anschliessend über die geschlossene Objektkontur ergänzt.
+        vth = int(bg_val * 0.75)
+        ds = 3
         hue_distance = np.abs(((hue_channel - bg_hue + 127.5) % 255) - 127.5)
         background_like = (
-            (hue_distance <= hue_margin) &
-            (saturation_channel >= sat_min) &
-            (value_channel <= bg_val + 70)
+            (hue_distance <= 12)
         )
-        mask = (value_channel > vth) & ~background_like
+        mask = (value_channel < vth) | ~background_like
         background_kind = 'blau/petrol'
     else:
         # Schwarze/graue Boeden sind oft texturiert und enthalten helle, aber
@@ -172,8 +154,8 @@ def process_image(fn, outputpath_Ausschnitte):
     )
     show_image(im_filled)
 
-    im_float = im_filled.astype(np.float32) / 255.0
-    im_hsv = oe.rgb_to_hsv(im_float)
+    im_float = im_resized.astype(np.float32) / 255.0
+    im_hsv = mpl_rgb_to_hsv(im_float) * 255
 
     bg_rgb = estimate_background_rgb(im_resized)
     mask, vth, ds, background_kind, bg_hue, bg_sat, bg_val = build_mask_for_background(im_hsv, bg_rgb)
@@ -188,11 +170,32 @@ def process_image(fn, outputpath_Ausschnitte):
     mask = remove_small_objects(mask.astype(bool), min_size=min_mask_object_size)
     mask = remove_small_holes(mask, area_threshold=min_mask_object_size)
 
-    morphed_mask = oe.morphology_transform(
-        mask,
-        shape=square,
-        erosion_size=es,
-        dilation_size=ds
+    if background_kind == 'blau/petrol':
+        # Kleine Störungen entfernen, Konturlücken schliessen und die
+        # umschlossenen blauen Teile des Balls wieder aufnehmen.
+        morphed_mask = binary_opening(mask, disk(2))
+        morphed_mask = binary_closing(morphed_mask, disk(3))
+        morphed_mask = oe.fill_borders(
+            morphed_mask, value_to_fill=False,
+            fraction_of_rows_to_remove=fr, fraction_of_cols_to_remove=fc
+        )
+        components = label(morphed_mask)
+        candidates = oe.regionprops(components)
+        if candidates:
+            largest = max(candidates, key=lambda region: region.area)
+            # Die Bälle sind konvex: so bleiben auch ähnlich blaue Flächen
+            # erhalten, deren Kontur zur Hintergrundfarbe hin offen ist.
+            morphed_mask = convex_hull_image(components == largest.label)
+        morphed_mask = binary_fill_holes(morphed_mask)
+    else:
+        morphed_mask = oe.morphology_transform(
+            mask, shape=square, erosion_size=es, dilation_size=ds
+        )
+    # Randbeschnitt erst auf die fertige Maske anwenden: aufgefüllte schwarze
+    # Ränder dürfen bei dunklen Objekten nicht als Vordergrund erscheinen.
+    morphed_mask = oe.fill_borders(
+        morphed_mask, value_to_fill=False,
+        fraction_of_rows_to_remove=fr, fraction_of_cols_to_remove=fc
     )
     morphed_mask = remove_small_objects(morphed_mask.astype(bool), min_size=min_mask_object_size)
     show_image(morphed_mask)
