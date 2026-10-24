@@ -94,7 +94,7 @@ def save_combined_region(fn, masked_image, regions, outputpath, min_num_pixels):
     return len(relevant_regions)
 
 
-def build_mask_for_background(im_hsv, bg_rgb):
+def build_mask_for_background(im_hsv, bg_rgb, object_kind='wallball'):
     hue_channel = im_hsv[:, :, 0]
     saturation_channel = im_hsv[:, :, 1]
     value_channel = im_hsv[:, :, 2]
@@ -118,6 +118,17 @@ def build_mask_for_background(im_hsv, bg_rgb):
         )
         mask = (value_channel < vth) | ~background_like
         background_kind = 'blau/petrol'
+    elif object_kind in {'kettlebell', 'dumbbell', 'dumbbells'}:
+        # Farbe findet auch kleine Hanteln; die helleren, schwach
+        # gesättigten Metallgriffe werden über den Value-Kanal ergänzt.
+        vth = max(65, min(110, int(bg_val + 15)))
+        bright_vth = max(125, min(185, int(bg_val + 65)))
+        ds = 2
+        mask = (
+            ((value_channel > vth) & (saturation_channel > 30)) |
+            ((value_channel > bright_vth) & (saturation_channel > 15))
+        )
+        background_kind = 'schwarz/grau'
     else:
         # Schwarze/graue Boeden sind oft texturiert und enthalten helle, aber
         # schwach gesaettigte Reflexe. Deshalb reicht V > vth nicht aus:
@@ -138,6 +149,11 @@ def build_mask_for_background(im_hsv, bg_rgb):
 
 def process_image(fn, outputpath_Ausschnitte):
     print(f'Verarbeite: {fn}')
+    object_kind = fn.parent.name.lower()
+    is_weight = object_kind in {'kettlebell', 'dumbbell', 'dumbbells'}
+    # Die kleinen Dumbbells haben bei 225 x 400 oft weniger als 1000 Pixel.
+    minimum_area = 150 if is_weight else mpx
+    minimum_fragment = 30 if is_weight else min_mask_object_size
 
     im = oe.load_file(fn)
     show_image(im)
@@ -158,7 +174,7 @@ def process_image(fn, outputpath_Ausschnitte):
     im_hsv = mpl_rgb_to_hsv(im_float) * 255
 
     bg_rgb = estimate_background_rgb(im_resized)
-    mask, vth, ds, background_kind, bg_hue, bg_sat, bg_val = build_mask_for_background(im_hsv, bg_rgb)
+    mask, vth, ds, background_kind, bg_hue, bg_sat, bg_val = build_mask_for_background(im_hsv, bg_rgb, object_kind)
 
     print(f'Hintergrund RGB geschaetzt: {bg_rgb.astype(int)}')
     print(f'Hintergrund HSV geschaetzt: H={bg_hue:.1f}, S={bg_sat:.1f}, V={bg_val:.1f}')
@@ -167,10 +183,27 @@ def process_image(fn, outputpath_Ausschnitte):
 
     show_image(mask)
 
-    mask = remove_small_objects(mask.astype(bool), min_size=min_mask_object_size)
-    mask = remove_small_holes(mask, area_threshold=min_mask_object_size)
+    if is_weight:
+        mask = oe.fill_borders(
+            mask, value_to_fill=False,
+            fraction_of_rows_to_remove=fr, fraction_of_cols_to_remove=fc
+        )
+    mask = remove_small_objects(mask.astype(bool), min_size=minimum_fragment)
+    mask = remove_small_holes(mask, area_threshold=minimum_fragment)
 
-    if background_kind == 'blau/petrol':
+    if is_weight:
+        # Keine starke Erosion und keine konvexe Hülle: schmale Stangen
+        # und die Öffnung im Kettlebell-Griff sollen erhalten bleiben.
+        morphed_mask = binary_closing(mask, disk(2))
+        morphed_mask = binary_opening(morphed_mask, disk(1))
+        morphed_mask = remove_small_holes(morphed_mask, area_threshold=200)
+        components = label(morphed_mask)
+        candidates = [r for r in oe.regionprops(components) if r.area >= minimum_area]
+        if candidates:
+            # Pro Aufnahme liegt ein Gewicht im Bild; Bodenreflexe verwerfen.
+            largest = max(candidates, key=lambda region: region.area)
+            morphed_mask = components == largest.label
+    elif background_kind == 'blau/petrol':
         # Kleine Störungen entfernen, Konturlücken schliessen und die
         # umschlossenen blauen Teile des Balls wieder aufnehmen.
         morphed_mask = binary_opening(mask, disk(2))
@@ -197,7 +230,7 @@ def process_image(fn, outputpath_Ausschnitte):
         morphed_mask, value_to_fill=False,
         fraction_of_rows_to_remove=fr, fraction_of_cols_to_remove=fc
     )
-    morphed_mask = remove_small_objects(morphed_mask.astype(bool), min_size=min_mask_object_size)
+    morphed_mask = remove_small_objects(morphed_mask.astype(bool), min_size=minimum_fragment)
     show_image(morphed_mask)
 
     masked_image = oe.create_masked_image(im_filled, morphed_mask)
@@ -212,7 +245,7 @@ def process_image(fn, outputpath_Ausschnitte):
         fraction_of_rows_to_remove=fr
     )
 
-    relevante_regionen = [reg for reg in regions if reg.area >= mpx]
+    relevante_regionen = [reg for reg in regions if reg.area >= minimum_area]
     print(f'Gefundene Regionen: {len(regionlist)}, relevante Regionen: {len(relevante_regionen)}')
 
     return save_combined_region(
@@ -220,7 +253,7 @@ def process_image(fn, outputpath_Ausschnitte):
         masked_image,
         regions,
         outputpath_Ausschnitte,
-        mpx
+        minimum_area
     )
 
 
